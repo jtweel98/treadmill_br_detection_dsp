@@ -25,7 +25,7 @@ HOST = "192.168.0.190"
 
 C = 2.99792458e8
 BUFFER_TIME = 30
-DISTANCE = 1
+DISTANCE = 1 # [m]
 MAX_LIN_R = 0.5
 MIN_COR_VALUE = 0.3
 ZERO_PAD = 2**13
@@ -38,7 +38,15 @@ speed_tracker_active = len(sys.argv) > 2
 radar_config = None
 dsp = None
 
-# Helper Functions ------------------------------------------------
+# Signal Handler ------------------------------------------------
+def signal_handler(sig, frame):
+    make_giff()
+    radar_socket.close()
+    speed_socket.close()
+    exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Helper Functions -------------------------------------------------
 def recvall(sock, n):
     data = bytearray()
     while len(data) < n:
@@ -48,59 +56,20 @@ def recvall(sock, n):
         data.extend(packet)
     return data
 
+def perc_error(data, ref):
+    data = np.abs(np.subtract(data, ref))
+    perc_error = np.divide(data, ref)
+    return 100*np.mean(perc_error)
+
 def fetch_json_packet(sock):
     packet_length = int(recvall(sock, HEADER_LENGTH).decode("utf-8"))
     serialized_packet = recvall(sock, packet_length).decode("utf-8")
     json_packet = json.loads(serialized_packet)
     return json_packet
 
-# Signal Handler ------------------------------------------------
-def signal_handler(sig, frame):
-    make_giff()
-    radar_socket.close()
-    speed_socket.close()
-    exit(0)
-signal.signal(signal.SIGINT, signal_handler)
-
-# Thread Functions ------------------------------------------------
-def speed_thread_func():
-    global current_speed
-    while True:
-        packet_length = int(recvall(speed_socket, HEADER_LENGTH).decode("utf-8"))
-        current_speed = round(float(recvall(speed_socket, packet_length).decode("utf-8")), 2)
-
-def run_session(title="Default", buffer_time=20, time_delay=0):
-    global radar_config
-
-    N = radar_config.num_samples_per_chirp
-    M = radar_config.frame_rate * buffer_time
-
-    # skip_time = 10
-    # skip_samples = skip_time*radar_config.frame_rate
-
-    # os.system('say "Skipping Samples"')
-    # while skip_samples > 0:
-    #     data_packet = fetch_json_packet(radar_socket)
-    #     skip_samples -= 1
-    # os.system('say "Done Skipping Samples"')
-
-    chirp_buffer = np.zeros((M, N))
-
-    chirps_collected = 0
-    while chirps_collected < M:
-        # Fetch packet
-        data_packet = fetch_json_packet(radar_socket)
-        
-        # Collect chirp
-        chirp = data_packet["data"]
-
-        # Store chirp data
-        chirp_buffer[chirps_collected] = chirp
-
-        chirps_collected += 1
-
-        print("Chirp Collection Progress: {}%".format((100*chirps_collected)//M), end="\r")
-    return chirp_buffer
+def speed_to_hz(speed):
+    # from lin regression in matlab
+    return 0.558818761181517 + 0.328498003233751*speed
 
 def phase_unwrap(phase_buffer, remove_dc=True):
     for j in range(len(phase_buffer)):
@@ -115,6 +84,46 @@ def phase_unwrap(phase_buffer, remove_dc=True):
     phase_buffer = detrend(phase_buffer) if remove_dc else phase_buffer
     return phase_buffer
 
+def get_phase_array(range_fft, speed=0):
+    global dsp, radar_config, current_speed
+
+    fs = radar_config.frame_rate
+
+    high_hz = 2
+    low_hz = 0.15
+    if speed_tracker_active or speed != 0:
+        high_hz = speed_to_hz(speed) if speed !=0 else speed_to_hz(current_speed)
+        low_hz = 0.65
+
+    phase_array = np.angle(range_fft)
+    phase_array = phase_unwrap(phase_array)
+    phase_array = detrend(phase_array)
+    phase_array = dsp.bp_filter_butterworth(phase_array, high_cutoff=high_hz, low_cutoff=low_hz, fs=fs, order=10)
+    return phase_array
+
+def configure_radar():
+    global radar_config, dsp
+
+    # Fetch config data first
+    config_packet = fetch_json_packet(radar_socket)
+    assert config_packet["packet_type"] == "config"
+
+    # Set global variables based on config
+    radar_config = RadarConfig(config_packet["data"])
+    dsp = DigitalSignalProcessor(radar_config)
+
+    # Save to File
+    with open("config.json", "w") as file:
+        json.dump(config_packet, file)
+
+def single_fft_capture():
+    global dsp
+    chirp = fetch_json_packet(radar_socket)["data"]
+    chirp = detrend(chirp)
+    freq_data = fft(chirp)[0:len(chirp)//2]
+    dsp.range_fft_plot(freq_data, "without dc")
+
+# Plotting and Processing Functions -------------------------------------------------
 def offline_processing(file_number, br):
     global radar_config, dsp
 
@@ -184,321 +193,6 @@ def offline_processing(file_number, br):
     axs4[1].plot([br]*len(br_data_fft), "g--")
 
     plt.show()
-
-def speed_to_hz(speed):
-    # from lin regression in matlab
-    return 0.558818761181517 + 0.328498003233751*speed
-
-def get_phase_array(range_fft, speed=0):
-    global dsp, radar_config, current_speed
-
-    fs = radar_config.frame_rate
-
-    high_hz = 2
-    low_hz = 0.15
-    if speed_tracker_active or speed != 0:
-        high_hz = speed_to_hz(speed) if speed !=0 else speed_to_hz(current_speed)
-        low_hz = 0.65
-
-    phase_array = np.angle(range_fft)
-    phase_array = phase_unwrap(phase_array)
-    phase_array = detrend(phase_array)
-    phase_array = dsp.bp_filter_butterworth(phase_array, high_cutoff=high_hz, low_cutoff=low_hz, fs=fs, order=10)
-    return phase_array
-
-def measure_br():
-    global radar_config
-
-    d_bin = int(DISTANCE//radar_config.range_resolution - 1)
-
-    fs = radar_config.frame_rate 
-
-    max_rpm = 70 # WITH TREADMILL
-    # max_rpm = 30 # NO TREADMILL
-
-    N = radar_config.num_samples_per_chirp
-    M = fs * BUFFER_TIME
-    zero_amount = ZERO_PAD - M
-
-    chirp_buffer = np.zeros((N//2, M), dtype=complex)
-    fft_buffer = np.zeros((N//2, ZERO_PAD//2), dtype=complex)
-
-    br_data_fft = []
-    br_data_acorr = []
-
-    fig, axs = plt.subplots(1, 2)
-    fig.set_figheight(3)
-    fig.set_figwidth(12)
-
-    save_num = 0
-    chirps_collected = 0
-
-    while(True):
-        chirp_buffer = np.roll(chirp_buffer, -1, axis=1)
-        chirp_buffer[:, M-1] = fft(fetch_json_packet(radar_socket)["data"])[0:N//2]
-        chirps_collected += 1
-
-        if chirps_collected < M:
-            continue
-
-        if chirps_collected == M:
-            print("Buffer Filled!")
-
-        if chirps_collected % radar_config.frame_rate != 0:
-            continue
-
-        # Save Matrix Data
-        d_bin_buffer = chirp_buffer[d_bin]
-        with open('buffer_{}.npy'.format(save_num), 'wb') as buffer_file:
-            np.save(buffer_file, d_bin_buffer)
-
-        # Save Speed
-        with open('speed_{}.npy'.format(save_num), 'wb') as speed_file:
-            np.save(speed_file, np.array([current_speed]))
-
-        print("Last Saved: ", save_num)
-        save_num = (save_num + 1)%10
-
-        # DSP
-        phase_array = get_phase_array(chirp_buffer[d_bin], speed=2.52)
-
-        # Apply Hanning window and FFT of slow time signal
-        sig_hanning = np.multiply(phase_array, hann(M))
-        sig_hanning = list(sig_hanning) + [0]*zero_amount
-        fft_buffer = fft(sig_hanning)[0:ZERO_PAD//2]
-
-        # Apply autocorrelation 
-        acorr = dsp.auto_correlate(phase_array, fs)
-        
-        # Clear Graphs
-        axs[0].cla()
-        axs[1].cla()
-
-        # Autocorrelation Prediction
-        acorr_prediction = 0
-        auto_failed = False
-        lin_r = np.abs(linregress(np.arange(1, M // 2), acorr)[2])
-        if lin_r > MAX_LIN_R:
-            auto_failed = True
-    
-        max_samples_per_breath = fs * (60 // max_rpm)
-        peaks = None
-        if max_samples_per_breath < 1:
-            peaks = find_peaks(acorr, prominence=0.4)[0]
-        else:
-            peaks = find_peaks(acorr, distance=max_samples_per_breath, prominence=0.4)[0]
-            
-
-        if len(peaks) > 1:
-            lag = peaks[1] - peaks[0]
-            corr_val = acorr[peaks[1]]
-            if corr_val < MIN_COR_VALUE:
-                auto_failed = True
-            else:
-                acorr_prediction = 60*fs/lag
-        else:
-            auto_failed = True
-
-        # Plotting Autocorrelation
-        axs[0].plot(acorr) # TODO: Fix Axis
-        if (len(peaks) > 0):
-            axs[0].plot(peaks, acorr[peaks], 'xr')
-
-        # FFT BR Prediction
-        fft_prediction = 0
-        st_fft = np.abs(fft_buffer[0:ZERO_PAD//32])
-        st_fft = np.divide(st_fft, max(st_fft))
-        min_peak_distance = max_rpm*ZERO_PAD/(60*fs)
-        # fft_peaks = find_peaks(st_fft, distance=min_peak_distance, prominence=0.15, height=0.5)[0] # NO TREADMILL
-        fft_peaks = find_peaks(st_fft, prominence=0.05, height=0.7)[0] # WITH TREADMILL
-
-        # Find the correct peak
-        # ideal_peak = 
-
-
-        if len(fft_peaks) > 0:
-            fft_prediction = 60*fft_peaks[0]*fs/ZERO_PAD
-
-        # Plotting FFT
-        f_vals = np.linspace(0, fs/2, ZERO_PAD//2)[0:ZERO_PAD//32]
-        axs[1].plot(f_vals, st_fft)
-        if len(fft_peaks) > 0:
-            axs[1].plot(np.multiply(fft_peaks, fs/ZERO_PAD), st_fft[fft_peaks], "xr")
-
-        # Draw Plots
-        plt.draw()
-        plt.pause(0.000001)
-
-        if auto_failed:
-            acorr_prediction = 0
-
-        # Capture and Save Breathing Array
-        br_data_fft.append(1.15*fft_prediction)
-        br_data_acorr.append(acorr_prediction)
-
-        with open('br_fft.npy', 'wb') as br_file:
-            np.save(br_file, br_data_fft)
-
-        with open('br_acorr.npy', 'wb') as br_file:
-            np.save(br_file, br_data_acorr)
-
-        # print(st_fft[fft_peaks], 60)
-        print("Auto BR: {}, FFT BR: {}".format( round(acorr_prediction, 2), round(1.15*fft_prediction, 2)))
-
-def configure_radar():
-    global radar_config, dsp
-
-    # Fetch config data first
-    config_packet = fetch_json_packet(radar_socket)
-    assert config_packet["packet_type"] == "config"
-
-    # Set global variables based on config
-    radar_config = RadarConfig(config_packet["data"])
-    dsp = DigitalSignalProcessor(radar_config)
-
-    # Save to File
-    with open("config.json", "w") as file:
-        json.dump(config_packet, file)
-
-def fetch_static_clutter():
-    data = []
-    with open("static_clutter.csv", mode="r") as csv_file:
-        csv_reader = csv.reader(csv_file, delimiter=",")
-        data = next(csv_reader)
-        data = [ complex(val) for val in data ]
-    
-    return data
-
-# def make_giff():
-#     global radar_config
-
-#     # Load Config
-#     with open("config.json", "r") as file:
-#         config_packet = json.load(file)
-#         radar_config = RadarConfig(config_packet["data"])
-
-#     giff_fft = None
-#     giff_peaks = None
-#     with open('br_fft.npy', 'wb') as br_fft_file:
-#         with open('br_fft_peaks.npy', 'wb') as br_peaks_file:
-#             giff_fft = np.load(br_fft_file)
-#             giff_peaks = np.load(br_peaks_file)
-
-#     fs = radar_config.frame_rate
-#     f_vals = np.linspace(0, fs/2, ZERO_PAD//2)[0:ZERO_PAD//32]
-
-#     fig, ax = plt.subplots(1)
-#     ln1, = plt.plot([], [], 'ro')
-#     ln2, = plt.plot([], [], 'm*')
-
-#     def init():
-#         ax.set_xlim(0,1)
-    
-#     def update(i):
-#         ln1.set_data(f_vals, giff_fft[i])
-        
-#         peaks = giff_peaks[i]
-#         if peaks
-#         ln2.set_data(x, ycos)
-    
-#     ani = FuncAnimation(
-
-#     )
-
-
-def session_dsp(chirp_buffer, buffer_time, type="abs"):
-    global radar_config, dsp
-
-    N = radar_config.num_samples_per_chirp
-    M = radar_config.frame_rate * buffer_time
-
-    fft_buffer = np.zeros((M, N//2), dtype=complex)
-    doppler_fft_buffer = np.zeros((N//2, M//2), dtype=complex)
-
-    # static_clutter = fetch_static_clutter()
-
-    # Compute range fft
-    for i in range(M):
-        chirp = deepcopy(chirp_buffer[i])
-        chirp = detrend(chirp)
-        fft_buffer[i] = fft(chirp)[0:N//2]
-        # fft_buffer[i] = np.subtract(fft_buffer[i], static_clutter)
-        print("Range FFT Progress: {}%".format((100*(i+1))//M), end="\r")
-
-    # LPF Bin time series
-    fr = radar_config.frame_rate
-    for i in range(N//2):
-        fft_buffer[:, i] = dsp.lp_filter_butterworth(fft_buffer[:, i], 4, fr)
-    
-    # Compute doppler fft
-    for i in range(N//2):
-        range_bin = deepcopy(fft_buffer[:, i])
-        range_bin = detrend(range_bin)
-        range_data = np.real(range_bin) if type=="real" else np.abs(range_bin)
-        doppler_fft_buffer[i] = fft(range_data)[0:M//2]
-        print("Doppler FFT Progress: {}%".format((100*(i+1))//(N//2)), end="\r")
-
-    return fft_buffer, doppler_fft_buffer
-
-def session_plots(range_fft_buffer, doppler_fft_buffer, title="Default", distance=0.6, skip_gif=True):
-    global dsp
-
-    # Subplots of FFT Bins Over Entire Buffer Time
-    dsp.range_bin_plot(range_fft_buffer, distance, title_afix=title)
-
-    # FFT Per Bin (doppler fft)
-    dsp.doppler_fft_bin_plot(range_fft_buffer, distance, title_afix=title)
-
-    if not skip_gif:
-        # Range FFT GIF
-        dsp.range_fft_gif(range_fft_buffer, title_afix=title)
-
-def single_fft_capture():
-    global dsp
-    chirp = fetch_json_packet(radar_socket)["data"]
-    chirp = detrend(chirp)
-    freq_data = fft(chirp)[0:len(chirp)//2]
-    dsp.range_fft_plot(freq_data, "without dc")
-
-def radar_main_thread_old():
-    global radar_config, dsp
-
-    # Fetch config data first
-    config_packet = fetch_json_packet(radar_socket)
-    assert config_packet["packet_type"] == "config"
-
-    # Set global variables based on config
-    radar_config = RadarConfig(config_packet["data"])
-    dsp = DigitalSignalProcessor(radar_config)
-
-    SESSION_DETAILS = {
-        0: {
-            "file_name": sys.argv[2],
-            "complex_type": sys.argv[3],
-            "distance": float(sys.argv[4]),
-            "measurement_time": int(sys.argv[5])
-        },
-    }
-
-    chirp_data = [None] * len(SESSION_DETAILS)
-    range_fft_data = [None] * len(SESSION_DETAILS)
-    doppler_fft_data = [None] * len(SESSION_DETAILS)
-
-    for i in range(len(SESSION_DETAILS)):
-        chirp_data[i] = run_session(
-            buffer_time=SESSION_DETAILS[i]["measurement_time"], title=SESSION_DETAILS[i]["file_name"]
-        )
-    
-    for i in range(len(SESSION_DETAILS)):
-        range_fft_data[i], doppler_fft_data[i] = session_dsp(
-            chirp_buffer=chirp_data[i], buffer_time=SESSION_DETAILS[i]["measurement_time"], type=SESSION_DETAILS[i]["complex_type"]
-        )
-
-    print("Plotting Data ...")
-    for i in range(len(SESSION_DETAILS)):
-        session_plots(range_fft_data[i], doppler_fft_data[i], SESSION_DETAILS[i]["file_name"], SESSION_DETAILS[i]["distance"], skip_gif=False)
-
-    return
 
 def plot_results():
     global radar_config, dsp
@@ -794,7 +488,7 @@ def plot_results():
     fig6.set_figwidth(16)
     fig6.savefig("./Result Plots/Walking and Running at 50 BPM.png", dpi=200, bbox_inches='tight')
 
-    # Plot Arm Movement Frequency  -------------------------------------------------------------
+    # Plot Arm Movement Frequency (data from MATLAB)  -------------------------------------------------------------
     hz_data = [0.80808, 0.88725, 0.96579, 1.02433, 1.1168, 1.2, 1.321585, 1.34983, 1.3801, 1.43541, 1.46431] # Hz
     speed = [0.83, 1.03, 1.24, 1.46, 1.69, 1.88, 2.1, 2.37, 2.52, 2.7, 2.9] # m/s
     speed = np.multiply(speed, 3.6) # to km/h
@@ -825,10 +519,151 @@ def plot_results():
 
     # plt.show()
 
-def perc_error(data, ref):
-    data = np.abs(np.subtract(data, ref))
-    perc_error = np.divide(data, ref)
-    return 100*np.mean(perc_error)
+# Speed and Radar Thread Functions ------------------------------------------------
+def measure_speed():
+    global current_speed
+    while True:
+        packet_length = int(recvall(speed_socket, HEADER_LENGTH).decode("utf-8"))
+        current_speed = round(float(recvall(speed_socket, packet_length).decode("utf-8")), 2)
+
+def measure_br():
+    global radar_config
+
+    d_bin = int(DISTANCE//radar_config.range_resolution - 1)
+
+    fs = radar_config.frame_rate 
+
+    max_rpm = 70 # WITH TREADMILL
+    # max_rpm = 30 # NO TREADMILL
+
+    N = radar_config.num_samples_per_chirp
+    M = fs * BUFFER_TIME
+    zero_amount = ZERO_PAD - M
+
+    chirp_buffer = np.zeros((N//2, M), dtype=complex)
+    fft_buffer = np.zeros((N//2, ZERO_PAD//2), dtype=complex)
+
+    br_data_fft = []
+    br_data_acorr = []
+
+    fig, axs = plt.subplots(1, 2)
+    fig.set_figheight(3)
+    fig.set_figwidth(12)
+
+    save_num = 0
+    chirps_collected = 0
+
+    while(True):
+        chirp_buffer = np.roll(chirp_buffer, -1, axis=1)
+        chirp_buffer[:, M-1] = fft(fetch_json_packet(radar_socket)["data"])[0:N//2]
+        chirps_collected += 1
+
+        if chirps_collected < M:
+            continue
+
+        if chirps_collected == M:
+            print("Buffer Filled!")
+
+        if chirps_collected % radar_config.frame_rate != 0:
+            continue
+
+        # Save Matrix Data
+        d_bin_buffer = chirp_buffer[d_bin]
+        with open('buffer_{}.npy'.format(save_num), 'wb') as buffer_file:
+            np.save(buffer_file, d_bin_buffer)
+
+        # Save Speed
+        with open('speed_{}.npy'.format(save_num), 'wb') as speed_file:
+            np.save(speed_file, np.array([current_speed]))
+
+        print("Last Saved: ", save_num)
+        save_num = (save_num + 1)%10
+
+        # DSP
+        phase_array = get_phase_array(chirp_buffer[d_bin], speed=2.52)
+
+        # Apply Hanning window and FFT of slow time signal
+        sig_hanning = np.multiply(phase_array, hann(M))
+        sig_hanning = list(sig_hanning) + [0]*zero_amount
+        fft_buffer = fft(sig_hanning)[0:ZERO_PAD//2]
+
+        # Apply autocorrelation 
+        acorr = dsp.auto_correlate(phase_array, fs)
+        
+        # Clear Graphs
+        axs[0].cla()
+        axs[1].cla()
+
+        # Autocorrelation Prediction
+        acorr_prediction = 0
+        auto_failed = False
+        lin_r = np.abs(linregress(np.arange(1, M // 2), acorr)[2])
+        if lin_r > MAX_LIN_R:
+            auto_failed = True
+    
+        max_samples_per_breath = fs * (60 // max_rpm)
+        peaks = None
+        if max_samples_per_breath < 1:
+            peaks = find_peaks(acorr, prominence=0.4)[0]
+        else:
+            peaks = find_peaks(acorr, distance=max_samples_per_breath, prominence=0.4)[0]
+            
+
+        if len(peaks) > 1:
+            lag = peaks[1] - peaks[0]
+            corr_val = acorr[peaks[1]]
+            if corr_val < MIN_COR_VALUE:
+                auto_failed = True
+            else:
+                acorr_prediction = 60*fs/lag
+        else:
+            auto_failed = True
+
+        # Plotting Autocorrelation
+        axs[0].plot(acorr) # TODO: Fix Axis
+        if (len(peaks) > 0):
+            axs[0].plot(peaks, acorr[peaks], 'xr')
+
+        # FFT BR Prediction
+        fft_prediction = 0
+        st_fft = np.abs(fft_buffer[0:ZERO_PAD//32])
+        st_fft = np.divide(st_fft, max(st_fft))
+        min_peak_distance = max_rpm*ZERO_PAD/(60*fs)
+        # fft_peaks = find_peaks(st_fft, distance=min_peak_distance, prominence=0.15, height=0.5)[0] # NO TREADMILL
+        fft_peaks = find_peaks(st_fft, prominence=0.05, height=0.7)[0] # WITH TREADMILL
+
+        # Find the correct peak
+        # ideal_peak = 
+
+
+        if len(fft_peaks) > 0:
+            fft_prediction = 60*fft_peaks[0]*fs/ZERO_PAD
+
+        # Plotting FFT
+        f_vals = np.linspace(0, fs/2, ZERO_PAD//2)[0:ZERO_PAD//32]
+        axs[1].plot(f_vals, st_fft)
+        if len(fft_peaks) > 0:
+            axs[1].plot(np.multiply(fft_peaks, fs/ZERO_PAD), st_fft[fft_peaks], "xr")
+
+        # Draw Plots
+        plt.draw()
+        plt.pause(0.000001)
+
+        if auto_failed:
+            acorr_prediction = 0
+
+        # Capture and Save Breathing Array
+        br_data_fft.append(1.15*fft_prediction)
+        br_data_acorr.append(acorr_prediction)
+
+        with open('br_fft.npy', 'wb') as br_file:
+            np.save(br_file, br_data_fft)
+
+        with open('br_acorr.npy', 'wb') as br_file:
+            np.save(br_file, br_data_acorr)
+
+        # print(st_fft[fft_peaks], 60)
+        print("Auto BR: {}, FFT BR: {}".format( round(acorr_prediction, 2), round(1.15*fft_prediction, 2)))
 
 
 if __name__ == "__main__":
@@ -853,7 +688,7 @@ if __name__ == "__main__":
         print("Connected to Radar Socket: ", (HOST, SPEED_PORT))
 
     if speed_tracker_active:
-        speed_thread = Thread(target=speed_thread_func)
+        speed_thread = Thread(target=measure_speed)
         speed_thread.start()
 
     
