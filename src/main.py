@@ -18,6 +18,7 @@ from scipy.stats import linregress
 from scipy.signal import find_peaks
 from scipy.signal.windows import hann
 import cmath
+import argparse
 
 # Constants
 HEADER_LENGTH = 4
@@ -34,9 +35,10 @@ ZERO_PAD = 2**13
 current_speed = 0
 radar_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 speed_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-speed_tracker_active = len(sys.argv) > 2
+speed_tracker_active = False
 radar_config = None
 dsp = None
+save_data = False
 
 # Signal Handler ------------------------------------------------
 def signal_handler(sig, frame):
@@ -113,8 +115,9 @@ def configure_radar():
     dsp = DigitalSignalProcessor(radar_config)
 
     # Save to File
-    with open("config.json", "w") as file:
-        json.dump(config_packet, file)
+    if save_data:
+        with open("config.json", "w") as file:
+            json.dump(config_packet, file)
 
 def single_fft_capture():
     global dsp
@@ -268,7 +271,6 @@ def plot_results():
     f_vals = np.linspace(0, 1.17*fs/2, ZERO_PAD//2)[0:ZERO_PAD//32]
     min_peak_distance = max_rpm*ZERO_PAD/(60*fs)
     fft_peaks = find_peaks(st_fft, distance=min_peak_distance, prominence=0.3, height=0.7)[0]
-    # print(fft_peaks[0]*1.17*fs/ZERO_PAD)
     # Apply autocorrelation 
     acorr = dsp.auto_correlate(phase_array, fs, offline_plot=True)
     max_samples_per_breath = fs * (60 // max_rpm)
@@ -280,7 +282,7 @@ def plot_results():
     axs2[1].plot(f_vals, st_fft, "b-")
     if len(fft_peaks) > 0:
         axs2[1].plot(np.multiply(fft_peaks, 1.17*fs/ZERO_PAD), st_fft[fft_peaks], "xr")
-    # print("Lag Time: ", peaks[0]/(1.17*fs))
+
     axs2[0].set(
         title="Autocorrelated Slow-Time Signal",
         ylabel="Normalized Correlation Coefficient",
@@ -527,18 +529,17 @@ def measure_speed():
         current_speed = round(float(recvall(speed_socket, packet_length).decode("utf-8")), 2)
 
 def measure_br():
-    global radar_config
+    global radar_config, speed_tracker_active
 
-    d_bin = int(DISTANCE//radar_config.range_resolution - 1)
+    d_bin = int(DISTANCE//radar_config.range_resolution - 1) # Bin Corresponding to Distance
 
     fs = radar_config.frame_rate 
 
-    max_rpm = 70 # WITH TREADMILL
-    # max_rpm = 30 # NO TREADMILL
+    max_rpm = 70 if speed_tracker_active else 30
 
     N = radar_config.num_samples_per_chirp
     M = fs * BUFFER_TIME
-    zero_amount = ZERO_PAD - M
+    zero_amount = ZERO_PAD - M # amount of zero padding to add to doppler fft
 
     chirp_buffer = np.zeros((N//2, M), dtype=complex)
     fft_buffer = np.zeros((N//2, ZERO_PAD//2), dtype=complex)
@@ -567,20 +568,21 @@ def measure_br():
         if chirps_collected % radar_config.frame_rate != 0:
             continue
 
-        # Save Matrix Data
-        d_bin_buffer = chirp_buffer[d_bin]
-        with open('buffer_{}.npy'.format(save_num), 'wb') as buffer_file:
-            np.save(buffer_file, d_bin_buffer)
+        if save_data:
+            # Save Matrix Data
+            d_bin_buffer = chirp_buffer[d_bin]
+            with open('buffer_{}.npy'.format(save_num), 'wb') as buffer_file:
+                np.save(buffer_file, d_bin_buffer)
 
-        # Save Speed
-        with open('speed_{}.npy'.format(save_num), 'wb') as speed_file:
-            np.save(speed_file, np.array([current_speed]))
+            # Save Speed
+            with open('speed_{}.npy'.format(save_num), 'wb') as speed_file:
+                np.save(speed_file, np.array([current_speed]))
 
-        print("Last Saved: ", save_num)
-        save_num = (save_num + 1)%10
+            print("Last Saved: ", save_num)
+            save_num = (save_num + 1)%10
 
-        # DSP
-        phase_array = get_phase_array(chirp_buffer[d_bin], speed=2.52)
+        # DSP --------------------------------------------------------
+        phase_array = get_phase_array(chirp_buffer[d_bin])
 
         # Apply Hanning window and FFT of slow time signal
         sig_hanning = np.multiply(phase_array, hann(M))
@@ -594,7 +596,7 @@ def measure_br():
         axs[0].cla()
         axs[1].cla()
 
-        # Autocorrelation Prediction
+        # Autocorrelation Prediction ------------------------------------------------
         acorr_prediction = 0
         auto_failed = False
         lin_r = np.abs(linregress(np.arange(1, M // 2), acorr)[2])
@@ -608,7 +610,6 @@ def measure_br():
         else:
             peaks = find_peaks(acorr, distance=max_samples_per_breath, prominence=0.4)[0]
             
-
         if len(peaks) > 1:
             lag = peaks[1] - peaks[0]
             corr_val = acorr[peaks[1]]
@@ -624,20 +625,20 @@ def measure_br():
         if (len(peaks) > 0):
             axs[0].plot(peaks, acorr[peaks], 'xr')
 
-        # FFT BR Prediction
+        # FFT BR Prediction ------------------------------------------------
         fft_prediction = 0
         st_fft = np.abs(fft_buffer[0:ZERO_PAD//32])
         st_fft = np.divide(st_fft, max(st_fft))
         min_peak_distance = max_rpm*ZERO_PAD/(60*fs)
-        # fft_peaks = find_peaks(st_fft, distance=min_peak_distance, prominence=0.15, height=0.5)[0] # NO TREADMILL
-        fft_peaks = find_peaks(st_fft, prominence=0.05, height=0.7)[0] # WITH TREADMILL
 
-        # Find the correct peak
-        # ideal_peak = 
-
+        fft_peaks = None
+        if speed_tracker_active:
+            fft_peaks = find_peaks(st_fft, prominence=0.05, height=0.7)[0] # WITH TREADMILL
+        else:
+            fft_peaks = find_peaks(st_fft, distance=min_peak_distance, prominence=0.15, height=0.5)[0] # NO TREADMILL
 
         if len(fft_peaks) > 0:
-            fft_prediction = 60*fft_peaks[0]*fs/ZERO_PAD
+            fft_prediction = 1.15*60*fft_peaks[0]*fs/ZERO_PAD
 
         # Plotting FFT
         f_vals = np.linspace(0, fs/2, ZERO_PAD//2)[0:ZERO_PAD//32]
@@ -653,47 +654,47 @@ def measure_br():
             acorr_prediction = 0
 
         # Capture and Save Breathing Array
-        br_data_fft.append(1.15*fft_prediction)
-        br_data_acorr.append(acorr_prediction)
+        if save_data:    
+            br_data_fft.append(fft_prediction) # Prediction is off by constant 15%
+            br_data_acorr.append(acorr_prediction)
 
-        with open('br_fft.npy', 'wb') as br_file:
-            np.save(br_file, br_data_fft)
+            with open('br_fft.npy', 'wb') as br_file:
+                np.save(br_file, br_data_fft)
 
-        with open('br_acorr.npy', 'wb') as br_file:
-            np.save(br_file, br_data_acorr)
+            with open('br_acorr.npy', 'wb') as br_file:
+                np.save(br_file, br_data_acorr)
 
-        # print(st_fft[fft_peaks], 60)
-        print("Auto BR: {}, FFT BR: {}".format( round(acorr_prediction, 2), round(1.15*fft_prediction, 2)))
+        print("Auto BR: {}, FFT BR: {}".format( round(acorr_prediction, 2), round(fft_prediction, 2)))
 
 
 if __name__ == "__main__":
-
-    plot_results()
-    # offline_processing(6,55)
-    exit(0)
-
-    time.sleep(3)
-    if len(sys.argv) < 2:
-        print("Usage: python {command} <radar-port> <speed-tracker-port> (optional)".format(command=sys.argv[0]))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-hip', '--host_ip', default=HOST ,help='Raspberry Pi Host IP')
+    parser.add_argument('-rp', '--radar_port', help='Radar Server Port')
+    parser.add_argument('-sp', '--speed_port', default="0000", help='Speed Sensor Server Port')  # Assumes measurements for treadmill are taking palce
+    args = parser.parse_args()
+    speed_tracker_active = args.speed_port != "0000"
+    
+    if args.radar_port is None:
+        print("Usage: python {command} -rp <radar-port> -sp <speed-tracker-port> -hip <rp-host-ip> -t (use this to activate treadmill)".format(command=sys.argv[0]))
         exit(0)
 
     # Setup Socket Connections and Start Threads
-    RADAR_PORT = int(sys.argv[1])
+    RADAR_PORT = int(args.radar_port)
     radar_socket.connect((HOST, RADAR_PORT))
     print("Connected to Radar Socket: ", (HOST, RADAR_PORT))
 
     if speed_tracker_active:
-        SPEED_PORT = int(sys.argv[2])
+        SPEED_PORT = int(args.speed_port)
         speed_socket.connect((HOST, SPEED_PORT))
-        print("Connected to Radar Socket: ", (HOST, SPEED_PORT))
+        print("Connected to Speed Sensor Socket: ", (HOST, SPEED_PORT))
 
     if speed_tracker_active:
         speed_thread = Thread(target=measure_speed)
         speed_thread.start()
 
-    
     configure_radar()
     measure_br()
-    
+
     if speed_tracker_active:
         speed_thread.join()
