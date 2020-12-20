@@ -22,7 +22,7 @@ import argparse
 
 # Constants
 HEADER_LENGTH = 4
-HOST = "192.168.0.190"
+HOST = "192.168.50.97" # Change this to raspberry Pi IP address (type "hostname -I" in rp terminal)
 
 C = 2.99792458e8
 BUFFER_TIME = 30
@@ -42,7 +42,6 @@ save_data = False
 
 # Signal Handler ------------------------------------------------
 def signal_handler(sig, frame):
-    make_giff()
     radar_socket.close()
     speed_socket.close()
     exit(0)
