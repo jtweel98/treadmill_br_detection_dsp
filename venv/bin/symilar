@@ -1,0 +1,10 @@
+#!/bin/sh
+'''exec' "/Users/james/Library/Mobile Documents/com~apple~CloudDocs/University of Waterloo/University Terms/4A/BME 399/vital_detection_dsp/venv/bin/python3" "$0" "$@"
+' '''
+# -*- coding: utf-8 -*-
+import re
+import sys
+from pylint import run_symilar
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(run_symilar())
